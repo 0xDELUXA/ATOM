@@ -7,7 +7,7 @@ import asyncio
 import json
 import logging
 import time
-from typing import Any, AsyncGenerator, Dict, List, Optional, Union
+from typing import Any, AsyncGenerator, Dict, List, Optional
 
 from .protocol import (
     CHAT_COMPLETION_CHUNK_OBJECT,
@@ -18,12 +18,6 @@ from .reasoning import ReasoningFilter, separate_reasoning
 from .tool_parser import ToolCallStreamParser, parse_tool_calls
 
 logger = logging.getLogger("atom")
-
-
-def _prompt_token_count(prompt_or_tokens: Union[str, List[int]], tokenizer) -> int:
-    if isinstance(prompt_or_tokens, str):
-        return len(tokenizer.encode(prompt_or_tokens))
-    return len(prompt_or_tokens)
 
 
 def create_chat_chunk(
@@ -61,10 +55,9 @@ def create_chat_chunk(
 async def stream_chat_response(
     request_id: str,
     model: str,
-    prompt: Union[str, List[int]],
     stream_queue: asyncio.Queue,
     seq_id: int,
-    tokenizer,
+    num_prompt_tokens: int,
     cleanup_fn,
     tools=None,
 ) -> AsyncGenerator[str, None]:
@@ -74,8 +67,12 @@ async def stream_chat_response(
     - reasoning_content deltas during thinking phase
     - content deltas for the answer
     - tool_calls deltas when model invokes tools
+
+    ``num_prompt_tokens`` is the engine-computed prompt length (``Sequence.
+    num_prompt_tokens``); reusing it avoids re-tokenizing the prompt on the
+    event loop at stream start.
     """
-    num_tokens_input = _prompt_token_count(prompt, tokenizer)
+    num_tokens_input = num_prompt_tokens
     num_tokens_output = 0
     reasoning_filter = ReasoningFilter()
     tool_parser = ToolCallStreamParser(tools=tools)
@@ -153,7 +150,6 @@ async def stream_chat_response(
         "completion_tokens": num_tokens_output,
         "total_tokens": num_tokens_input + num_tokens_output,
     }
-    yield create_chat_chunk(request_id, model, finish_reason=finish_reason)
     usage_chunk = {
         "id": request_id,
         "object": CHAT_COMPLETION_CHUNK_OBJECT,
@@ -163,8 +159,14 @@ async def stream_chat_response(
     }
     if kv_transfer_params_value is not None:
         usage_chunk["kv_transfer_params"] = kv_transfer_params_value
-    yield f"data: {json.dumps(usage_chunk)}\n\n"
-    yield STREAM_DONE_MESSAGE
+    # Coalesce finish + usage + [DONE] into one send: at a wave boundary many
+    # requests finalize at once, so collapsing 3 socket writes/req to 1 cuts
+    # the syscalls that saturate the API event loop.
+    yield (
+        create_chat_chunk(request_id, model, finish_reason=finish_reason)
+        + f"data: {json.dumps(usage_chunk)}\n\n"
+        + STREAM_DONE_MESSAGE
+    )
 
 
 def _build_chat_choice(
@@ -279,10 +281,9 @@ def build_chat_response_multi(
 async def stream_chat_response_fanout(
     request_id: str,
     model: str,
-    prompt: Union[str, List[int]],
     shared_queue: asyncio.Queue,
     seq_ids: List[int],
-    tokenizer,
+    num_prompt_tokens: int,
     cleanup_fn,
     tools=None,
 ) -> AsyncGenerator[str, None]:
@@ -292,9 +293,13 @@ async def stream_chat_response_fanout(
     The shared queue receives ``(sibling_index, chunk_data)`` tuples from
     the engine callbacks registered in :func:`setup_streaming_request_fanout`.
     Reasoning + tool-call state is kept independently per sibling.
+
+    ``num_prompt_tokens`` is the engine-computed prompt length shared by all
+    siblings (they tokenize the same prompt once); reusing it avoids
+    re-tokenizing on the event loop at stream start.
     """
     n = len(seq_ids)
-    num_tokens_input = _prompt_token_count(prompt, tokenizer)
+    num_tokens_input = num_prompt_tokens
     num_tokens_output = [0] * n
     reasoning_filters = [ReasoningFilter() for _ in range(n)]
     tool_parsers = [ToolCallStreamParser(tools=tools) for _ in range(n)]
@@ -378,10 +383,6 @@ async def stream_chat_response_fanout(
     for sid in seq_ids:
         cleanup_fn(request_id, sid)
 
-    for i in range(n):
-        finish_reason = "tool_calls" if has_tool_calls[i] else "stop"
-        yield create_chat_chunk(request_id, model, finish_reason=finish_reason, index=i)
-
     usage = {
         "prompt_tokens": num_tokens_input,
         "completion_tokens": sum(num_tokens_output),
@@ -397,5 +398,17 @@ async def stream_chat_response_fanout(
     }
     if kv_transfer_params_value is not None:
         usage_chunk["kv_transfer_params"] = kv_transfer_params_value
-    yield f"data: {json.dumps(usage_chunk)}\n\n"
-    yield STREAM_DONE_MESSAGE
+    # Coalesce the per-sibling finish chunks + usage + [DONE] into one send.
+    yield (
+        "".join(
+            create_chat_chunk(
+                request_id,
+                model,
+                finish_reason="tool_calls" if has_tool_calls[i] else "stop",
+                index=i,
+            )
+            for i in range(n)
+        )
+        + f"data: {json.dumps(usage_chunk)}\n\n"
+        + STREAM_DONE_MESSAGE
+    )
